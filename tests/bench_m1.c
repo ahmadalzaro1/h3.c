@@ -358,6 +358,43 @@ int main(int argc, char **argv) {
         printf("int8_mlp: API reports UNAVAILABLE on this device (expected on Metal 3)\n");
     }
 
+    /* ---- chunked-vs-unchunked equivalence check ----
+     * The whole chunked-FP16 claim rests on "matmul is row-wise
+     * independent => bitwise-identical results". Verify it: run the
+     * MLP unchunked into tb_out, then chunked into ch_out[], read both
+     * back and compare byte-for-byte. Only meaningful with H3_MPS_FP16
+     * (the phased path) since that is the chunked claim. */
+    if (getenv("H3_MPS_FP16")) {
+        printf("\n# chunked-vs-unchunked equivalence (H3_MPS_FP16 phased path)\n");
+        h3_gpu_begin(gpu);
+        h3_gpu_mlp_bf16_fp16_phased(gpu, tb_out, tb_in, tb_fc1, tb_fc2,
+                                    rows, H3_WIDTH, FFN, H3_WIDTH);
+        for (uint32_t c = 0; c < n_chunks; c++)
+            h3_gpu_mlp_bf16_fp16_phased(gpu, ch_out[c], ch_in[c], tb_fc1,
+                                        tb_fc2, ch_rows[c], H3_WIDTH, FFN,
+                                        H3_WIDTH);
+        h3_gpu_submit(gpu);
+        uint16_t *ref = malloc(bf16_out_el * sizeof(uint16_t));
+        uint16_t *got = malloc(bf16_out_el * sizeof(uint16_t));
+        if (!ref || !got) fail("equivalence malloc");
+        h3_gpu_tensor_read_bf16(tb_out, ref, bf16_out_el);
+        size_t mismatches = 0;
+        for (uint32_t c = 0; c < n_chunks; c++) {
+            size_t off = (size_t)c * CHUNK * H3_WIDTH;
+            size_t cnt = (size_t)ch_rows[c] * H3_WIDTH;
+            h3_gpu_tensor_read_bf16(ch_out[c], got + off, cnt);
+        }
+        for (size_t i = 0; i < bf16_out_el; i++)
+            if (ref[i] != got[i]) mismatches++;
+        if (mismatches == 0)
+            printf("equivalence: PASS — %zu elements identical\n", bf16_out_el);
+        else
+            printf("equivalence: FAIL — %zu/%zu elements differ\n",
+                   mismatches, bf16_out_el);
+        free(ref);
+        free(got);
+    }
+
     h3_gpu_free(gpu);
     free(buf);
     printf("\n# done\n");
