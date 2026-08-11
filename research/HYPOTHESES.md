@@ -1,0 +1,3 @@
+
+## [2026-08-11T20:23] Apple M1 Max
+HYPOTHESIS 1 (CORRECTED): Portable BF16 MLP on M1 Max is GPU-compute-bound at ~3.7 TFLOP/s (36% of 10.4 peak), NOT CPU-encode-bound. Evidence: wait_ms==wall_ms (256.7 vs 256.9) across all ops; root gpu_ms undercounts MPSGraph child buffers (documented README limitation). First reading (gpu_ms=0 -> 'encode-bound') was WRONG; corrected by adding command_wait_seconds to bench. NEXT: probe MPSGraph INT8 matmul (MPSDataTypeInt8) at H3 shapes - if int8 halves weight traffic and MPSGraph executes it faster than BF16 on Metal 3, portable int8 MLP is the contribution. Also probe matmul efficiency: is MPSGraph picking a slow M1 path?

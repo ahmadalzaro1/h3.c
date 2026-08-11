@@ -1,0 +1,15 @@
+timestamp,device,rows,iters,label,op,wall_ms,perf_gflops,bandwidth_GBps,gpu_ms,mps_dispatch,direct_dispatch
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,fc1_linear_f32_5376x28672,136.98,4609.0,7.0,0.0,10,0
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,fc1_swiglu_fc2_f32,272.33,3478.0,6.0,13.6,20,10
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,mlp_bf16_fused,258.03,3670.0,3.0,0.0,20,0
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,fc1_swiglu_fc2_bf16_split,257.12,3683.0,3.0,9.06,20,10
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,qkv_linear_f32_5376x7168,33.38,4729.0,8.0,3.32,10,0
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,attn_out_linear_f32_7168x5376,37.32,4230.0,7.0,3.67,10,0
+2026-08-11T20:15:35,Apple M1 Max,2048,10,baseline-2048,sdpa_f32_56h_128d,36.99,1626.0,5.0,3.84,0,0
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,fc1_linear_f32_5376x28672,33.89,4657.0,20.0,3.39,10,0
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,fc1_swiglu_fc2_f32,68.63,3450.0,20.0,3.41,20,10
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,mlp_bf16_fused,64.06,3696.0,11.0,2.19,20,0
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,fc1_swiglu_fc2_bf16_split,65.02,3642.0,10.0,2.16,20,10
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,qkv_linear_f32_5376x7168,8.44,4676.0,21.0,3.33,10,0
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,attn_out_linear_f32_7168x5376,10.07,3917.0,18.0,3.99,10,0
+2026-08-11T20:15:39,Apple M1 Max,512,10,baseline-512,sdpa_f32_56h_128d,4.11,914.0,11.0,1.61,0,0
