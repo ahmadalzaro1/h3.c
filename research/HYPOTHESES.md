@@ -13,3 +13,6 @@ EXPERIMENT 3 (BREAKTHROUGH): FP16 MPSGraph is ~2x faster than BF16 on M1 Max. Ra
 
 ## [2026-08-12T00:10] Apple M1 Max
 EXPERIMENT 4 (phased FP16-resident MLP + custom h3_swiglu_fp16) — RESULT: HYPOTHESIS FALSIFIED at big rows. Full crossover: 256r BF16 32.89 vs FP16 19.47 (1.69x FASTER); 512r 66.41 vs 37.67 (1.76x FASTER); 1024r 128.61 vs 225.40 (1.75x SLOWER); 2048r 254.05 vs 435.79 (1.72x SLOWER). Custom half2 SwiGLU adds ~0 over MPSGraph fused split+sigmoid+multiply at every row size. Raw single-GEMM FP16 win (93 vs 173ms @2048) does NOT survive chaining — MPSGraph FP16 multi-op DAG at large rows is the bottleneck, not entry/exit casts. MoA '~150ms @2048' prediction falsified. Next: examine whether large-row loss is MPSGraph kernel selection (fp16 GEMM tiles) vs memory bandwidth of 117MB intermediate.
+
+## [2026-08-12T00:15] Apple M1 Max
+EXPERIMENT 4 follow-up (crossover localization): razor-sharp kernel boundary. 640r 1.75x, 672r 1.82x, 704r 1.77x WIN; 736r 0.55x, 768r 0.53x, 896r 0.59x LOSS. Boundary between 704 and 736 rows (22x32 vs 23x32 tiles) — MPSGraph switches FP16 GEMM strategy. Deterministic auto-select threshold: rows<=704 → FP16 phased MLP (1.8x), rows>704 → BF16 fused (1.9x better). This is the shippable contribution: env-toggle H3_MPS_FP16 stays default-off, but an auto-router can pick per-batch.
