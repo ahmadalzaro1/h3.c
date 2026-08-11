@@ -4,3 +4,9 @@ HYPOTHESIS 1 (CORRECTED): Portable BF16 MLP on M1 Max is GPU-compute-bound at ~3
 
 ## [2026-08-11T20:28] Apple M1 Max
 EXPERIMENT 1 (PROBE, NEGATIVE): MPSGraph int8 matmul is IMPOSSIBLE on any Metal — MLIR compiler rejects si8 operands ('must be tensor of floating point values'). Portable-int8-via-MPSGraph thesis DEAD (killed in 30min instead of 3 weeks). M5 kernels need Metal 4 matmul2d/tensor types — hardware-locked, can't compile on M1. Remaining int8 option: hand-written Metal int8 dot-product kernel (llama.cpp style, plain threads, portable to Metal 3) — weeks, high effort.
+
+## [2026-08-11T20:39] Apple M1 Max
+EXPERIMENT 2 (A/B, NEGATIVE): H3_FORCE_DIRECT_LINEAR=1 routes big matmuls through repo's h3_linear_bf16 16x16-tiled kernel. Result: 10-66x SLOWER than MPSGraph (qkv 34->2232ms, attn 37->2361ms, MLP split 257->1159ms). MPSGraph is already optimal for big linears on M1. Direct kernel stays patch-only. Remaining options: (a) hand-written portable int8 Metal matmul [weeks], (b) FP16 MPSGraph test [cheap], (c) SSD-streaming preset [blocked: no weights]
+
+## [2026-08-11T22:36] Apple M1 Max
+EXPERIMENT 3 (BREAKTHROUGH): FP16 MPSGraph is ~2x faster than BF16 on M1 Max. Raw matmul 5376x28672: 41.6->23.1ms (1.8x). Fused MLP fc1->swiglu->fc2: 1698->842ms (2.0x) with VALID fp16 data. Why: M1 GPU has native FP16 ALU (2x FP32); BF16 has no hw on Metal 3 -> MPSGraph emulates it. FP16 = same 2 bytes (no memory change) + BETTER mantissa (10 vs 7 bits). Caveat: BF16-bytes-reinterpreted-as-FP16 gives NaN data and runs SLOWER (433ms) - must do real conversion. Implementation: H3_MPS_FP16=1 env in h3_gpu.m (graph dtype flip) + one-time BF16->FP16 weight conversion at load. This is THE portable pre-M5 optimization - works on all M1/M2/M3/M4.

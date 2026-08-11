@@ -1078,6 +1078,7 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         return 1;
     }
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
+        !getenv("H3_FORCE_DIRECT_LINEAR") &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim, MPSDataTypeFloat32)) return 1;
     linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
@@ -2385,6 +2386,10 @@ static H3Linear *h3_gpu_linear_graph(H3GPU *gpu, uint32_t rows,
     }
 }
 
+static MPSDataType h3_mps_linear_dtype(void) {
+    return getenv("H3_MPS_FP16") ? MPSDataTypeFloat16 : MPSDataTypeBFloat16;
+}
+
 static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
                              const h3_gpu_tensor *weight,
@@ -2512,9 +2517,10 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         return 1;
     }
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
+        !getenv("H3_FORCE_DIRECT_LINEAR") &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim,
-                          MPSDataTypeBFloat16)) return 1;
+                          h3_mps_linear_dtype())) return 1;
     linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     if (!h3_gpu_require_command(gpu)) return 0;
@@ -2554,16 +2560,17 @@ static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,
 
         H3MLP *mlp = [[H3MLP alloc] init];
         mlp.graph = [[MPSGraph alloc] init];
+        MPSDataType dtype = h3_mps_linear_dtype();
         mlp.inputShape = @[@1, @(rows), @(input_dim)];
         mlp.fc1Shape = @[@1, @(hidden_dim * 2), @(input_dim)];
         mlp.fc2Shape = @[@1, @(output_dim), @(hidden_dim)];
         mlp.outputShape = @[@1, @(rows), @(output_dim)];
         mlp.input = [mlp.graph placeholderWithShape:mlp.inputShape
-                                           dataType:MPSDataTypeBFloat16 name:nil];
+                                           dataType:dtype name:nil];
         mlp.fc1Weight = [mlp.graph placeholderWithShape:mlp.fc1Shape
-                                               dataType:MPSDataTypeBFloat16 name:nil];
+                                               dataType:dtype name:nil];
         mlp.fc2Weight = [mlp.graph placeholderWithShape:mlp.fc2Shape
-                                               dataType:MPSDataTypeBFloat16 name:nil];
+                                               dataType:dtype name:nil];
         MPSGraphTensor *fc1Transposed =
             [mlp.graph transposeTensor:mlp.fc1Weight dimension:1
                          withDimension:2 name:nil];
@@ -2587,7 +2594,7 @@ static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,
             [mlp.graph matrixMultiplicationWithPrimaryTensor:activated
                                              secondaryTensor:fc2Transposed name:nil];
         mlp.output = [mlp.graph castTensor:result
-                                    toType:MPSDataTypeBFloat16 name:nil];
+                                    toType:dtype name:nil];
         gpu.mlpCache[key] = mlp;
         return mlp;
     }
@@ -2616,18 +2623,19 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!mlp) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
-        MPSGraphTensorData *inputData = h3_gpu_graph_data(
-            input, mlp.inputShape, MPSDataTypeBFloat16, 0);
-        MPSGraphTensorData *fc1Data = h3_gpu_graph_data(
-            fc1_weight, mlp.fc1Shape, MPSDataTypeBFloat16, 1);
-        MPSGraphTensorData *fc2Data = h3_gpu_graph_data(
-            fc2_weight, mlp.fc2Shape, MPSDataTypeBFloat16, 1);
-        MPSGraphTensorData *outputData = h3_gpu_graph_data(
-            output, mlp.outputShape, MPSDataTypeBFloat16, 0);
-        NSDictionary *feeds = @{mlp.input: inputData,
-                                mlp.fc1Weight: fc1Data,
-                                mlp.fc2Weight: fc2Data};
-        NSDictionary *results = @{mlp.output: outputData};
+        MPSDataType dtype = h3_mps_linear_dtype();
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, mlp.inputShape, dtype, 0);
+        MPSGraphTensorData *fc1_data = h3_gpu_graph_data(
+            fc1_weight, mlp.fc1Shape, dtype, 1);
+        MPSGraphTensorData *fc2_data = h3_gpu_graph_data(
+            fc2_weight, mlp.fc2Shape, dtype, 1);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, mlp.outputShape, dtype, 0);
+        NSDictionary *feeds = @{mlp.input: input_data,
+                                mlp.fc1Weight: fc1_data,
+                                mlp.fc2Weight: fc2_data};
+        NSDictionary *results = @{mlp.output: output_data};
         @try {
             [mlp.graph encodeToCommandBuffer:command feeds:feeds
                 targetOperations:nil resultsDictionary:results
