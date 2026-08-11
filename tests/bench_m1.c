@@ -190,6 +190,23 @@ int main(int argc, char **argv) {
         !tb_in || !tb_fc1 || !tb_fc2 || !tb_out || !tb_tmp1 || !tb_tmp2)
         fail("tensor allocation");
 
+    /* Chunked-execution tensors: matmul is row-wise independent, so a
+     * rows-wide MLP can run as ceil(rows/CHUNK) sequential MLPs on row
+     * slices with identical results. Forces MPSGraph into the small-row
+     * kernel (the <=704-row regime where FP16 wins 1.8x) even for big
+     * batches. We allocate per-chunk input/output tensors once, outside
+     * the timed loop. */
+    const uint32_t CHUNK = 704;
+    uint32_t n_chunks = (rows + CHUNK - 1) / CHUNK;
+    h3_gpu_tensor *ch_in[4]  = {0}, *ch_out[4] = {0};
+    uint32_t ch_rows[4] = {0};
+    for (uint32_t c = 0; c < n_chunks && c < 4; c++) {
+        ch_rows[c] = (c == n_chunks - 1) ? rows - c * CHUNK : CHUNK;
+        ch_in[c]  = h3_gpu_tensor_new_bf16(gpu, (size_t)ch_rows[c] * H3_WIDTH);
+        ch_out[c] = h3_gpu_tensor_new_bf16(gpu, (size_t)ch_rows[c] * H3_WIDTH);
+        if (!ch_in[c] || !ch_out[c]) fail("chunk tensor allocation");
+    }
+
     /* ---- measurement helpers ---- */
     struct bench {
         const char *name;
@@ -262,6 +279,23 @@ int main(int argc, char **argv) {
             printf("DIAG: phased op reported no dispatches; h3_gpu_error='%s'\n",
                    h3_gpu_error(gpu));
     }
+
+    /* Chunked FP16 phased: row slices of 704 force the fast small-row
+     * MPSGraph kernel on every chunk (matmul is row-wise independent). */
+    if (getenv("H3_MPS_FP16")) {
+        RUN_OP("mlp_fp16_phased_chunk704",
+            for (uint32_t c = 0; c < n_chunks; c++)
+                h3_gpu_mlp_bf16_fp16_phased(gpu, ch_out[c], ch_in[c],
+                                            tb_fc1, tb_fc2, ch_rows[c],
+                                            H3_WIDTH, FFN, H3_WIDTH));
+    }
+
+    /* Chunked BF16 fused: same slicing, BF16 path — isolates whether any
+     * chunk win is FP16-specific or a general MPSGraph small-row effect. */
+    RUN_OP("mlp_bf16_fused_chunk704",
+        for (uint32_t c = 0; c < n_chunks; c++)
+            h3_gpu_mlp_bf16(gpu, ch_out[c], ch_in[c], tb_fc1, tb_fc2,
+                            ch_rows[c], H3_WIDTH, FFN, H3_WIDTH));
 
     /* BF16 split: linear fc1 + swiglu + linear fc2 (portable path components) */
     RUN_OP("fc1_swiglu_fc2_bf16_split",
