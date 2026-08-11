@@ -299,6 +299,12 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *fc2_weight, uint32_t rows,
                     uint32_t input_dim, uint32_t hidden_dim,
                     uint32_t output_dim);
+int h3_gpu_mlp_bf16_fp16_phased(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *fc1_weight,
+                                const h3_gpu_tensor *fc2_weight,
+                                uint32_t rows, uint32_t input_dim,
+                                uint32_t hidden_dim, uint32_t output_dim);
 /* Experimental M5 Metal 4 paired FC1/SwiGLU plus direct FC2 path. Available
  * only when the context was created with H3_NAX=mlp. */
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

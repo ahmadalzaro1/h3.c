@@ -417,7 +417,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
             @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
             @"h3_qkv_rope_bf16_coop_uncached",
-            @"h3_swiglu_bf16",
+            @"h3_swiglu_bf16", @"h3_swiglu_fp16",
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
@@ -2353,8 +2353,12 @@ static H3Linear *h3_gpu_linear_graph(H3GPU *gpu, uint32_t rows,
                                      uint32_t input_dim, uint32_t output_dim,
                                      int has_bias, MPSDataType dataType) {
     @autoreleasepool {
+        BOOL fp16 = getenv("H3_MPS_FP16") != NULL &&
+                    dataType == MPSDataTypeBFloat16;
+        MPSDataType weight_type = fp16 ? MPSDataTypeFloat16 : dataType;
         NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%d:%u", rows,
-                         input_dim, output_dim, has_bias, (unsigned)dataType];
+                         input_dim, output_dim, has_bias,
+                         fp16 ? 0x4640u : (unsigned)dataType];
         H3Linear *cached = gpu.linearCache[key];
         if (cached) return cached;
 
@@ -2367,16 +2371,21 @@ static H3Linear *h3_gpu_linear_graph(H3GPU *gpu, uint32_t rows,
         linear.input = [linear.graph placeholderWithShape:linear.inputShape
                                                  dataType:dataType name:nil];
         linear.weight = [linear.graph placeholderWithShape:linear.weightShape
-                                                  dataType:dataType name:nil];
+                                                  dataType:weight_type name:nil];
+        MPSGraphTensor *input_t = linear.input;
+        if (fp16) {
+            input_t = [linear.graph castTensor:linear.input
+                                        toType:MPSDataTypeFloat16 name:nil];
+        }
         MPSGraphTensor *transposed =
             [linear.graph transposeTensor:linear.weight dimension:1
                             withDimension:2 name:nil];
         MPSGraphTensor *output =
-            [linear.graph matrixMultiplicationWithPrimaryTensor:linear.input
+            [linear.graph matrixMultiplicationWithPrimaryTensor:input_t
                                                 secondaryTensor:transposed name:nil];
         if (has_bias) {
             linear.bias = [linear.graph placeholderWithShape:linear.biasShape
-                                                    dataType:dataType name:nil];
+                                                    dataType:weight_type name:nil];
             output = [linear.graph additionWithPrimaryTensor:output
                                              secondaryTensor:linear.bias name:nil];
         }
@@ -2397,22 +2406,25 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              uint32_t input_dim, uint32_t output_dim,
                              MPSDataType dataType) {
     if (!h3_gpu_require_command(gpu)) return 0;
+    BOOL fp16 = getenv("H3_MPS_FP16") != NULL &&
+                dataType == MPSDataTypeBFloat16;
     H3Linear *linear = h3_gpu_linear_graph(gpu, rows, input_dim, output_dim,
                                            bias != NULL, dataType);
     if (!linear) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSDataType weight_type = fp16 ? MPSDataTypeFloat16 : dataType;
         MPSGraphTensorData *input_data = h3_gpu_graph_data(
             input, linear.inputShape, dataType, 0);
         MPSGraphTensorData *weight_data = h3_gpu_graph_data(
-            weight, linear.weightShape, dataType, 1);
+            weight, linear.weightShape, weight_type, 1);
         MPSGraphTensorData *output_data = h3_gpu_graph_data(
             output, linear.outputShape, dataType, 0);
         NSMutableDictionary *feeds = [@{linear.input: input_data,
                                          linear.weight: weight_data} mutableCopy];
         if (bias) {
             MPSGraphTensorData *bias_data = h3_gpu_graph_data(
-                bias, linear.biasShape, dataType, 1);
+                bias, linear.biasShape, weight_type, 1);
             feeds[linear.bias] = bias_data;
         }
         NSDictionary *results = @{linear.output: output_data};
@@ -2520,7 +2532,7 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !getenv("H3_FORCE_DIRECT_LINEAR") &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim,
-                          h3_mps_linear_dtype())) return 1;
+                          MPSDataTypeBFloat16)) return 1;
     linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     if (!h3_gpu_require_command(gpu)) return 0;
@@ -2553,29 +2565,39 @@ static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,
                                uint32_t input_dim, uint32_t hidden_dim,
                                uint32_t output_dim) {
     @autoreleasepool {
-        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u", rows,
-                         input_dim, hidden_dim, output_dim];
+        BOOL fp16 = getenv("H3_MPS_FP16") != NULL;
+        MPSDataType weight_type = fp16 ? MPSDataTypeFloat16 : MPSDataTypeBFloat16;
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%d", rows,
+                         input_dim, hidden_dim, output_dim, fp16];
         H3MLP *cached = gpu.mlpCache[key];
         if (cached) return cached;
 
         H3MLP *mlp = [[H3MLP alloc] init];
         mlp.graph = [[MPSGraph alloc] init];
-        MPSDataType dtype = h3_mps_linear_dtype();
         mlp.inputShape = @[@1, @(rows), @(input_dim)];
         mlp.fc1Shape = @[@1, @(hidden_dim * 2), @(input_dim)];
         mlp.fc2Shape = @[@1, @(output_dim), @(hidden_dim)];
         mlp.outputShape = @[@1, @(rows), @(output_dim)];
+        /* Activations are BF16 everywhere in the model. In FP16 mode the
+         * weights are converted to FP16 once at load; the graph casts the
+         * BF16 input up and the FP16 result back down around the matmuls. */
         mlp.input = [mlp.graph placeholderWithShape:mlp.inputShape
-                                           dataType:dtype name:nil];
+                                           dataType:MPSDataTypeBFloat16 name:nil];
         mlp.fc1Weight = [mlp.graph placeholderWithShape:mlp.fc1Shape
-                                               dataType:dtype name:nil];
+                                               dataType:weight_type name:nil];
         mlp.fc2Weight = [mlp.graph placeholderWithShape:mlp.fc2Shape
-                                               dataType:dtype name:nil];
+                                               dataType:weight_type name:nil];
+        MPSGraphTensor *input_t = mlp.input;
+        if (fp16) {
+            /* activations are BF16; cast to FP16 for the matmuls */
+            input_t = [mlp.graph castTensor:mlp.input
+                                     toType:MPSDataTypeFloat16 name:nil];
+        }
         MPSGraphTensor *fc1Transposed =
             [mlp.graph transposeTensor:mlp.fc1Weight dimension:1
                          withDimension:2 name:nil];
         MPSGraphTensor *fused =
-            [mlp.graph matrixMultiplicationWithPrimaryTensor:mlp.input
+            [mlp.graph matrixMultiplicationWithPrimaryTensor:input_t
                                              secondaryTensor:fc1Transposed name:nil];
         NSArray<MPSGraphTensor *> *halves =
             [mlp.graph splitTensor:fused numSplits:2 axis:2 name:nil];
@@ -2594,7 +2616,7 @@ static H3MLP *h3_gpu_mlp_graph(H3GPU *gpu, uint32_t rows,
             [mlp.graph matrixMultiplicationWithPrimaryTensor:activated
                                              secondaryTensor:fc2Transposed name:nil];
         mlp.output = [mlp.graph castTensor:result
-                                    toType:dtype name:nil];
+                                    toType:MPSDataTypeBFloat16 name:nil];
         gpu.mlpCache[key] = mlp;
         return mlp;
     }
@@ -2623,15 +2645,17 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!mlp) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
-        MPSDataType dtype = h3_mps_linear_dtype();
+        BOOL fp16 = getenv("H3_MPS_FP16") != NULL;
         MPSGraphTensorData *input_data = h3_gpu_graph_data(
-            input, mlp.inputShape, dtype, 0);
+            input, mlp.inputShape, MPSDataTypeBFloat16, 0);
         MPSGraphTensorData *fc1_data = h3_gpu_graph_data(
-            fc1_weight, mlp.fc1Shape, dtype, 1);
+            fc1_weight, mlp.fc1Shape,
+            fp16 ? MPSDataTypeFloat16 : MPSDataTypeBFloat16, 1);
         MPSGraphTensorData *fc2_data = h3_gpu_graph_data(
-            fc2_weight, mlp.fc2Shape, dtype, 1);
+            fc2_weight, mlp.fc2Shape,
+            fp16 ? MPSDataTypeFloat16 : MPSDataTypeBFloat16, 1);
         MPSGraphTensorData *output_data = h3_gpu_graph_data(
-            output, mlp.outputShape, dtype, 0);
+            output, mlp.outputShape, MPSDataTypeBFloat16, 0);
         NSDictionary *feeds = @{mlp.input: input_data,
                                 mlp.fc1Weight: fc1_data,
                                 mlp.fc2Weight: fc2_data};
@@ -2648,6 +2672,198 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     }
     h3_gpu_stats stats = gpu.stats;
     stats.mps_linear_dispatches += 2;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* Forward decl: defined later in this file (near h3_gpu_swiglu_bf16). */
+int h3_gpu_swiglu_fp16(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *fused, uint32_t rows,
+                       uint32_t width);
+
+/* H3_MPS_FP16_PHASED: FP16-resident MLP for Metal 3 (M1/M2/M3/M4).
+ *
+ * The fused one-graph MLP pays a large-row penalty: its BF16 input is cast
+ * to FP16, the 2*hidden FC1 activation (rows x 28672) lives in FP16, and
+ * MPSGraph materializes split+sigmoid+multiply on that big intermediate.
+ * Instead we keep FP16 through three small stages with ONE custom SwiGLU
+ * dispatch between two matmuls:
+ *
+ *   fc1 graph:  BF16 in  -> cast FP16 -> matmul(FP16 w) -> FP16 out
+ *   swiglu:     h3_swiglu_fp16 (half2 kernel)            -> FP16
+ *   fc2 graph:  FP16 in  -> matmul(FP16 w) -> cast BF16 -> BF16 out
+ *
+ * Only the entry cast (rows x input_dim) and exit cast (rows x output_dim)
+ * touch non-FP16 data; the big 2*hidden intermediate never leaves FP16.
+ * Weights are FP16 (converted once at load by H3_MPS_FP16). */
+static H3Linear *h3_gpu_phased_fc1_graph(H3GPU *gpu, uint32_t rows,
+                                         uint32_t input_dim,
+                                         uint32_t hidden_dim) {
+    NSString *key = [NSString stringWithFormat:@"pf1:%u:%u:%u", rows,
+                     input_dim, hidden_dim];
+    H3Linear *cached = gpu.linearCache[key];
+    if (cached) return cached;
+    @autoreleasepool {
+        H3Linear *lin = [[H3Linear alloc] init];
+        lin.graph = [[MPSGraph alloc] init];
+        lin.inputShape = @[@1, @(rows), @(input_dim)];
+        lin.weightShape = @[@1, @(hidden_dim * 2), @(input_dim)];
+        lin.outputShape = @[@1, @(rows), @(hidden_dim * 2)];
+        lin.input = [lin.graph placeholderWithShape:lin.inputShape
+                                           dataType:MPSDataTypeBFloat16
+                                               name:nil];
+        MPSGraphTensor *input_f16 = [lin.graph castTensor:lin.input
+                                                 toType:MPSDataTypeFloat16
+                                                    name:nil];
+        lin.weight = [lin.graph placeholderWithShape:lin.weightShape
+                                            dataType:MPSDataTypeFloat16
+                                                name:nil];
+        MPSGraphTensor *wt_t = [lin.graph transposeTensor:lin.weight
+                                                dimension:1
+                                           withDimension:2
+                                                    name:nil];
+        lin.output = [lin.graph matrixMultiplicationWithPrimaryTensor:input_f16
+                                                      secondaryTensor:wt_t
+                                                                 name:nil];
+        gpu.linearCache[key] = lin;
+        return lin;
+    }
+}
+
+static H3Linear *h3_gpu_phased_fc2_graph(H3GPU *gpu, uint32_t rows,
+                                         uint32_t hidden_dim,
+                                         uint32_t output_dim) {
+    NSString *key = [NSString stringWithFormat:@"pf2:%u:%u:%u", rows,
+                     hidden_dim, output_dim];
+    H3Linear *cached = gpu.linearCache[key];
+    if (cached) return cached;
+    @autoreleasepool {
+        H3Linear *lin = [[H3Linear alloc] init];
+        lin.graph = [[MPSGraph alloc] init];
+        lin.inputShape = @[@1, @(rows), @(hidden_dim)];
+        lin.weightShape = @[@1, @(output_dim), @(hidden_dim)];
+        lin.outputShape = @[@1, @(rows), @(output_dim)];
+        lin.input = [lin.graph placeholderWithShape:lin.inputShape
+                                           dataType:MPSDataTypeFloat16
+                                               name:nil];
+        lin.weight = [lin.graph placeholderWithShape:lin.weightShape
+                                            dataType:MPSDataTypeFloat16
+                                                name:nil];
+        MPSGraphTensor *wt_t = [lin.graph transposeTensor:lin.weight
+                                                dimension:1
+                                           withDimension:2
+                                                    name:nil];
+        MPSGraphTensor *result = [lin.graph
+            matrixMultiplicationWithPrimaryTensor:lin.input
+                                 secondaryTensor:wt_t
+                                            name:nil];
+        lin.output = [lin.graph castTensor:result
+                                   toType:MPSDataTypeBFloat16
+                                      name:nil];
+        gpu.linearCache[key] = lin;
+        return lin;
+    }
+}
+
+int h3_gpu_mlp_bf16_fp16_phased(h3_gpu *opaque, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *fc1_weight,
+                                const h3_gpu_tensor *fc2_weight,
+                                uint32_t rows, uint32_t input_dim,
+                                uint32_t hidden_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"phased MLP input") ||
+        !h3_gpu_require_bf16(gpu, fc1_weight,
+                             (size_t)hidden_dim * 2 * input_dim,
+                             @"phased MLP fc1 weight") ||
+        !h3_gpu_require_bf16(gpu, fc2_weight,
+                             (size_t)output_dim * hidden_dim,
+                             @"phased MLP fc2 weight") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"phased MLP output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+
+    /* Scratch: FC1 fused activation and swiglu output, both FP16-resident
+     * (stored in 2-byte BF16-storage tensors like the H3_MPS_FP16 path). */
+    h3_gpu_tensor *fused = h3_gpu_tensor_new_bf16(opaque,
+        (size_t)rows * hidden_dim * 2);
+    h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(opaque,
+        (size_t)rows * hidden_dim);
+    if (!fused || !activated) {
+        h3_gpu_tensor_free(fused);
+        h3_gpu_tensor_free(activated);
+        return 0;
+    }
+
+    H3Linear *fc1 = h3_gpu_phased_fc1_graph(gpu, rows, input_dim, hidden_dim);
+    H3Linear *fc2 = h3_gpu_phased_fc2_graph(gpu, rows, hidden_dim, output_dim);
+    if (!fc1 || !fc2) {
+        h3_gpu_tensor_free(fused);
+        h3_gpu_tensor_free(activated);
+        return 0;
+    }
+
+    int ok = 1;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+
+        /* Stage 1: BF16 in -> FP16 matmul -> FP16 fused activation */
+        MPSGraphTensorData *in_data = h3_gpu_graph_data(
+            input, fc1.inputShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *fc1w_data = h3_gpu_graph_data(
+            fc1_weight, fc1.weightShape, MPSDataTypeFloat16, 1);
+        MPSGraphTensorData *fused_data = h3_gpu_graph_data(
+            fused, fc1.outputShape, MPSDataTypeFloat16, 0);
+        NSDictionary *feeds1 = @{fc1.input: in_data,
+                                 fc1.weight: fc1w_data};
+        NSDictionary *res1 = @{fc1.output: fused_data};
+        @try {
+            [fc1.graph encodeToCommandBuffer:command feeds:feeds1
+                targetOperations:nil resultsDictionary:res1
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph phased fc1 failed: %@",
+                             exception.reason);
+            ok = 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+
+        /* Stage 2: custom half2 SwiGLU, FP16 -> FP16 */
+        if (ok && !h3_gpu_swiglu_fp16(opaque, activated, fused, rows,
+                                      hidden_dim)) ok = 0;
+
+        /* Stage 3: FP16 matmul -> BF16 out */
+        if (ok) {
+            MPSGraphTensorData *act_data = h3_gpu_graph_data(
+                activated, fc2.inputShape, MPSDataTypeFloat16, 0);
+            MPSGraphTensorData *fc2w_data = h3_gpu_graph_data(
+                fc2_weight, fc2.weightShape, MPSDataTypeFloat16, 1);
+            MPSGraphTensorData *out_data = h3_gpu_graph_data(
+                output, fc2.outputShape, MPSDataTypeBFloat16, 0);
+            NSDictionary *feeds2 = @{fc2.input: act_data,
+                                     fc2.weight: fc2w_data};
+            NSDictionary *res2 = @{fc2.output: out_data};
+            @try {
+                [fc2.graph encodeToCommandBuffer:command feeds:feeds2
+                    targetOperations:nil resultsDictionary:res2
+                    executionDescriptor:nil];
+            } @catch (NSException *exception) {
+                h3_gpu_set_error(gpu, @"MPSGraph phased fc2 failed: %@",
+                                 exception.reason);
+                ok = 0;
+            }
+            gpu.command = command.rootCommandBuffer;
+        }
+    }
+
+    h3_gpu_tensor_free(fused);
+    h3_gpu_tensor_free(activated);
+    if (!ok) return 0;
+
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches += 2;
+    stats.direct_dispatches += 1;
     gpu.stats = stats;
     return 1;
 }
@@ -4041,6 +4257,26 @@ int h3_gpu_swiglu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                               @"SwiGLU output")) return 0;
     swiglu_args args = {rows, width};
     return h3_gpu_dispatch_2d(gpu, @"h3_swiglu_bf16", width, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(fused).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+/* FP16 SwiGLU — tensors are 2-byte BF16-storage tensors carrying FP16 bits
+ * (H3_MPS_FP16 load path). Same buffer plumbing, half2 kernel. */
+int h3_gpu_swiglu_fp16(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *fused, uint32_t rows,
+                       uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, fused, (size_t)rows * width * 2,
+                              @"SwiGLU input") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * width,
+                              @"SwiGLU output")) return 0;
+    swiglu_args args = {rows, width};
+    uint32_t grid_width = (width + 1) / 2;   /* half2 column pairs */
+    return h3_gpu_dispatch_2d(gpu, @"h3_swiglu_fp16", grid_width, rows,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(fused).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];

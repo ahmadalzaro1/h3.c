@@ -3794,6 +3794,35 @@ kernel void h3_swiglu_bf16(device const ushort *fused [[buffer(0)]],
         h3_f32_to_bf16(gate / (1.0f + exp(-gate)) * up);
 }
 
+/* FP16 SwiGLU: fused input is [rows, 2*width] half, output [rows, width] half.
+ * Each thread handles 2 adjacent channels as half2 (gate half2 / up half2),
+ * computing silu(gate)*up in float and storing back half2. Used by the
+ * H3_MLP_FP16_PHASED path so the whole MLP stays FP16-resident. */
+kernel void h3_swiglu_fp16(device const half *fused [[buffer(0)]],
+                           device half *output [[buffer(1)]],
+                           constant swiglu_args &args [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint column2 = gid.x;  /* pairs of columns */
+    uint row = gid.y;
+    if (row >= args.rows || column2 >= (args.width + 1) / 2) return;
+    uint width = args.width;
+    uint base = row * width * 2;
+    uint ci = column2 * 2;
+    if (ci + 1 < width) {
+        half2 gate = *((device const half2 *)(fused + base + ci));
+        half2 up   = *((device const half2 *)(fused + base + width + ci));
+        float2 g = float2(gate);
+        float2 sig = 1.0f / (1.0f + exp(-g));
+        half2 out = half2(g * sig * float2(up));
+        *((device half2 *)(output + row * width + ci)) = out;
+    } else {
+        /* odd tail column */
+        float g = (float)fused[base + ci];
+        float up = (float)fused[base + width + ci];
+        output[row * width + ci] = (half)(g / (1.0f + exp(-g)) * up);
+    }
+}
+
 struct embedding_args {
     uint tokens;
     uint vocab_size;

@@ -48,6 +48,29 @@ static uint16_t f32_to_bf16(float value) {
     return (uint16_t)(bits >> 16);
 }
 
+static uint16_t f32_to_fp16(float value) {
+    union { float f; uint32_t u; } in;
+    in.f = value;
+    uint32_t sign = (in.u >> 16) & 0x8000u;
+    uint32_t exp = (in.u >> 23) & 0xffu;
+    uint32_t mant = in.u & 0x7fffffu;
+    if (exp == 0xff) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0));
+    int32_t e = (int32_t)exp - 127 + 15;
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (e <= 0) return (uint16_t)sign;
+    uint32_t m = mant >> 13;
+    uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) m++;
+    if (m == 0x400u) { m = 0; e++; }
+    return (uint16_t)(sign | ((uint32_t)e << 10) | m);
+}
+
+/* BF16 or FP16 bits depending on H3_MPS_FP16 (weights are converted to FP16
+ * at load in the real model path; the bench must mirror that). */
+static uint16_t f32_to_model_bits(float value) {
+    return getenv("H3_MPS_FP16") ? f32_to_fp16(value) : f32_to_bf16(value);
+}
+
 static void fill_rand(float *v, size_t n) {
     /* Deterministic but non-trivial: avoids RNG cost dominating tiny benches. */
     for (size_t i = 0; i < n; i++)
@@ -131,8 +154,8 @@ int main(int argc, char **argv) {
     uint16_t *b_tmp1 = bp; bp += bf16_tmp_el;
     uint16_t *b_tmp2 = bp; bp += bf16_tmp_el;
     for (size_t i = 0; i < bf16_in_el; i++) b_in[i] = f32_to_bf16(input[i]);
-    for (size_t i = 0; i < bf16_fc1_el; i++) b_fc1[i] = f32_to_bf16(fc1_w[i]);
-    for (size_t i = 0; i < bf16_fc2_el; i++) b_fc2[i] = f32_to_bf16(fc2_w[i]);
+    for (size_t i = 0; i < bf16_fc1_el; i++) b_fc1[i] = f32_to_model_bits(fc1_w[i]);
+    for (size_t i = 0; i < bf16_fc2_el; i++) b_fc2[i] = f32_to_model_bits(fc2_w[i]);
     memset(b_out, 0, bf16_out_el * sizeof(uint16_t));
     memset(b_tmp1, 0, bf16_tmp_el * sizeof(uint16_t));
     memset(b_tmp2, 0, bf16_tmp_el * sizeof(uint16_t));
@@ -225,6 +248,20 @@ int main(int argc, char **argv) {
     /* Portable BF16 MLP (the real DiT block MLP on non-M5 machines) */
     RUN_OP("mlp_bf16_fused",
         h3_gpu_mlp_bf16(gpu, tb_out, tb_in, tb_fc1, tb_fc2, rows, H3_WIDTH, FFN, H3_WIDTH));
+
+    /* Phased FP16-resident MLP (MoA experiment 4): fc1 BF16->FP16 GEMM,
+     * custom half2 SwiGLU, fc2 FP16 GEMM -> BF16. Requires H3_MPS_FP16
+     * so weights hold valid FP16 bits (BF16 data here would be NaN garbage
+     * and slow the FP16 path — same artifact as experiment 3). */
+    if (getenv("H3_MPS_FP16")) {
+        RUN_OP("mlp_fp16_phased",
+            h3_gpu_mlp_bf16_fp16_phased(gpu, tb_out, tb_in, tb_fc1, tb_fc2,
+                                        rows, H3_WIDTH, FFN, H3_WIDTH));
+        if (n_results > 0 && results[n_results-1].mps_dispatches == 0 &&
+            results[n_results-1].direct_dispatches == 0)
+            printf("DIAG: phased op reported no dispatches; h3_gpu_error='%s'\n",
+                   h3_gpu_error(gpu));
+    }
 
     /* BF16 split: linear fc1 + swiglu + linear fc2 (portable path components) */
     RUN_OP("fc1_swiglu_fc2_bf16_split",
