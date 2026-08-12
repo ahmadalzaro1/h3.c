@@ -141,6 +141,25 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
     return NULL;
 }
 
+/* Convert an f32 value to FP16 bits (round-to-nearest-even, flush subnormals
+ * to zero — fine for model weights). Used by the H3_MPS_FP16 load path. */
+static uint16_t h3_f32_to_fp16_bits(float value) {
+    union { float f; uint32_t u; } in;
+    in.f = value;
+    uint32_t sign = (in.u >> 16) & 0x8000u;
+    uint32_t exp = (in.u >> 23) & 0xffu;
+    uint32_t mant = in.u & 0x7fffffu;
+    if (exp == 0xff) return (uint16_t)(sign | 0x7c00u | (mant ? 0x200u : 0));
+    int32_t e = (int32_t)exp - 127 + 15;
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);   /* overflow -> inf */
+    if (e <= 0) return (uint16_t)sign;                /* subnormal/zero flush */
+    uint32_t m = mant >> 13;
+    uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (m & 1u))) m++;
+    if (m == 0x400u) { m = 0; e++; }
+    return (uint16_t)(sign | ((uint32_t)e << 10) | m);
+}
+
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape, h3_dtype dtype,
@@ -181,6 +200,38 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
                                (size_t)elements);
     if (!result) {
         fail(error, error_size, "cannot load %s: %s", name, h3_gpu_error(gpu));
+        return NULL;
+    }
+    /* H3_MPS_FP16: convert BF16 weights to FP16 once at load.
+     * Both are 2-byte formats; FP16 has native ALU support on Metal 3
+     * (M1..M4) while BF16 is emulated by MPSGraph — ~2x matmul speedup.
+     * See research/probe_int8_mps.m. The DiT transformer is the hot path;
+     * convert only BF16 tensors (F32 stays as-is). */
+    if (dtype == H3_DTYPE_BF16 && getenv("H3_MPS_FP16")) {
+        uint16_t *bits = malloc((size_t)elements * sizeof(uint16_t));
+        if (!bits) {
+            fail(error, error_size, "cannot allocate conversion buffer for %s", name);
+            return NULL;
+        }
+        if (!h3_gpu_tensor_read_bf16(result, bits, (size_t)elements)) {
+            fail(error, error_size, "cannot read %s for FP16 conversion: %s",
+                 name, h3_gpu_error(gpu));
+            free(bits);
+            return NULL;
+        }
+        for (size_t i = 0; i < (size_t)elements; i++) {
+            uint32_t u = (uint32_t)bits[i] << 16;      /* BF16 -> f32 bits */
+            float value;
+            memcpy(&value, &u, sizeof(value));
+            bits[i] = h3_f32_to_fp16_bits(value);
+        }
+        if (!h3_gpu_tensor_write_bf16(result, bits, (size_t)elements)) {
+            fail(error, error_size, "cannot write %s FP16 conversion: %s",
+                 name, h3_gpu_error(gpu));
+            free(bits);
+            return NULL;
+        }
+        free(bits);
     }
     return result;
 }

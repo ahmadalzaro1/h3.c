@@ -122,6 +122,8 @@
 @property(nonatomic) double profileStartWall;
 @property(nonatomic) double profileMarkWall;
 @property(nonatomic) double commandStartWall;
+@property(nonatomic, strong) H3Tensor *scratchFused;
+@property(nonatomic, strong) H3Tensor *scratchActivated;
 @end
 @implementation H3GPU
 @end
@@ -512,6 +514,16 @@ void h3_gpu_free(h3_gpu *gpu) {
                             object.profileStartWall);
         id<MTLDevice> device = object.device;
         NSUInteger before = device.currentAllocatedSize;
+        /* Release persistent scratch (must outlive encoded command buffers;
+         * h3_gpu_free runs after all submits have waited for completion). */
+        if (object.scratchFused) {
+            h3_gpu_tensor_free((__bridge h3_gpu_tensor *)object.scratchFused);
+            object.scratchFused = nil;
+        }
+        if (object.scratchActivated) {
+            h3_gpu_tensor_free((__bridge h3_gpu_tensor *)object.scratchActivated);
+            object.scratchActivated = nil;
+        }
         object.command = nil;
         object.inflightCommands = nil;
         object.sdpaCache = nil;
@@ -2765,6 +2777,55 @@ static H3Linear *h3_gpu_phased_fc2_graph(H3GPU *gpu, uint32_t rows,
     }
 }
 
+/* Scratch pool for multi-stage ops: tensors must OUTLIVE the MPS command
+ * buffer they are encoded into (freeing a tensor nils its MTLBuffer while
+ * the GPU may still be reading it -> "unknown Metal error"/NaN). Context
+ * owns them; they are released at h3_gpu_free after all commands complete. */
+static h3_gpu_tensor *h3_gpu_scratch_tensor(h3_gpu *opaque,
+                                            H3Tensor **slot,
+                                            size_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (*slot && (*slot).elements >= elements) {
+        h3_gpu_tensor *t = (__bridge h3_gpu_tensor *)*slot;
+        return t;
+    }
+    if (*slot) {
+        h3_gpu_tensor_free((__bridge h3_gpu_tensor *)*slot);
+        *slot = nil;
+    }
+    h3_gpu_tensor *t = h3_gpu_tensor_new_bf16(opaque, elements);
+    if (t) *slot = (__bridge H3Tensor *)t;
+    return t;
+}
+
+static float h3_phased_fp16_to_f32(uint16_t value) {
+    /* FP16 -> FP32 via scalar arithmetic (no half_t on host) */
+    uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+    uint32_t expo = (value >> 10) & 0x1fu;
+    uint32_t mant = value & 0x3ffu;
+    float f;
+    if (expo == 0) {
+        f = (mant == 0) ? 0.0f
+                        : (float)mant / 16777216.0f;   /* mant * 2^-24 */
+    } else if (expo == 31) {
+        f = (mant == 0) ? INFINITY : NAN;
+    } else {
+        f = (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)((int)expo - 15));
+    }
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    bits |= sign;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static float h3_phased_bf16_to_f32(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
 int h3_gpu_mlp_bf16_fp16_phased(h3_gpu *opaque, h3_gpu_tensor *output,
                                 const h3_gpu_tensor *input,
                                 const h3_gpu_tensor *fc1_weight,
@@ -2785,16 +2846,18 @@ int h3_gpu_mlp_bf16_fp16_phased(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_command(gpu)) return 0;
 
     /* Scratch: FC1 fused activation and swiglu output, both FP16-resident
-     * (stored in 2-byte BF16-storage tensors like the H3_MPS_FP16 path). */
-    h3_gpu_tensor *fused = h3_gpu_tensor_new_bf16(opaque,
+     * (stored in 2-byte BF16-storage tensors like the H3_MPS_FP16 path).
+     * Persistent on the context: must outlive the encoded MPS command
+     * buffer (per-call free = use-after-free -> unknown Metal error). */
+    H3Tensor *fused_slot = gpu.scratchFused;
+    H3Tensor *activated_slot = gpu.scratchActivated;
+    h3_gpu_tensor *fused = h3_gpu_scratch_tensor(opaque, &fused_slot,
         (size_t)rows * hidden_dim * 2);
-    h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(opaque,
+    h3_gpu_tensor *activated = h3_gpu_scratch_tensor(opaque, &activated_slot,
         (size_t)rows * hidden_dim);
-    if (!fused || !activated) {
-        h3_gpu_tensor_free(fused);
-        h3_gpu_tensor_free(activated);
-        return 0;
-    }
+    gpu.scratchFused = fused_slot;
+    gpu.scratchActivated = activated_slot;
+    if (!fused || !activated) return 0;
 
     H3Linear *fc1 = h3_gpu_phased_fc1_graph(gpu, rows, input_dim, hidden_dim);
     H3Linear *fc2 = h3_gpu_phased_fc2_graph(gpu, rows, hidden_dim, output_dim);
@@ -2829,9 +2892,32 @@ int h3_gpu_mlp_bf16_fp16_phased(h3_gpu *opaque, h3_gpu_tensor *output,
         }
         gpu.command = command.rootCommandBuffer;
 
+        if (getenv("H3_DEBUG_PHASED")) {
+            h3_gpu_submit(opaque);
+            uint16_t dbg[8];
+            h3_gpu_tensor_read_bf16(fused, dbg, 8);
+            fprintf(stderr, "phased: fused[0..7] (fp16) =");
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, " %.4g", h3_phased_fp16_to_f32(dbg[i]));
+            fprintf(stderr, "\n");
+            h3_gpu_begin(opaque);
+            command = h3_gpu_mps_command(gpu);
+        }
         /* Stage 2: custom half2 SwiGLU, FP16 -> FP16 */
         if (ok && !h3_gpu_swiglu_fp16(opaque, activated, fused, rows,
                                       hidden_dim)) ok = 0;
+
+        if (getenv("H3_DEBUG_PHASED")) {
+            h3_gpu_submit(opaque);
+            uint16_t dbg2[8];
+            h3_gpu_tensor_read_bf16(activated, dbg2, 8);
+            fprintf(stderr, "phased: activated[0..7] (fp16) =");
+            for (int i = 0; i < 8; i++)
+                fprintf(stderr, " %.4g", h3_phased_fp16_to_f32(dbg2[i]));
+            fprintf(stderr, "\n");
+            h3_gpu_begin(opaque);
+            command = h3_gpu_mps_command(gpu);
+        }
 
         /* Stage 3: FP16 matmul -> BF16 out */
         if (ok) {
@@ -2857,10 +2943,7 @@ int h3_gpu_mlp_bf16_fp16_phased(h3_gpu *opaque, h3_gpu_tensor *output,
         }
     }
 
-    h3_gpu_tensor_free(fused);
-    h3_gpu_tensor_free(activated);
     if (!ok) return 0;
-
     h3_gpu_stats stats = gpu.stats;
     stats.mps_linear_dispatches += 2;
     stats.direct_dispatches += 1;
